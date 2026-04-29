@@ -8,6 +8,10 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <mqueue.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 int readFilenames();
 
@@ -68,12 +72,61 @@ int main(int argc, char** argv) {
         printf("%d - ", i);
         printf("%s", files[i % 5]);
     }
-
-
     
+    const char* cmd_queue = "/cmd-queue";
+    const char* rsp_queue = "/rsp-queue";
+
+    char msg[BUFSIZE];
+    char response[BUFSIZE + 1];
+    char output_path[BUFSIZE * 2];
+
+    printf("========================\n");
+    int shm_fd = open("./client-shm", O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+    if (shm_fd == -1) {
+        perror("failed to initialize shared memory");
+        exit(1);
+    }
+    ftruncate(shm_fd, BUFSIZE);
+    char* shm_addr = mmap(NULL, BUFSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+
+    mqd_t mqd = mq_open(cmd_queue, O_WRONLY);
+    mqd_t rsp_mqd = mq_open(rsp_queue, O_RDONLY);
+    if (mqd == (mqd_t) -1) {
+        perror("failed to open message queue");
+        exit(1);
+    }
+    if (rsp_mqd == (mqd_t) -1) {
+        perror("failed to open response queue");
+        exit(1);
+    }
 
 
+    for (int i = 0; i < num_files; i++) {
+        files[i % 5][strcspn(files[i % 5], "\r\n")] = '\0';
+        snprintf(msg, sizeof(msg), "%zu:%s", (size_t)BUFSIZE, files[i % 5]);
+        mq_send(mqd, msg, strlen(msg), 0);
+        snprintf(output_path, sizeof(output_path), "./client_files/%s", files[i % 5]);
+        FILE* fp = fopen(output_path, "wb");
 
+        for (;;) {
+            size_t rsp_len = mq_receive(rsp_mqd, response, BUFSIZE, NULL);
+            response[rsp_len] = '\0';
+            size_t bytes = strtoull(response, NULL, 10);
+            fwrite(shm_addr, 1, bytes, fp);
+            if (bytes != BUFSIZE) break;
+
+            mq_send(mqd, "next", 4, 0);
+        }
+
+        fclose(fp);
+        printf("sent fil %d - %s\n", i, files[i % 5]);
+    }
+
+    mq_send(mqd, "close", 8, 0);
+    mq_close(mqd);
+    mq_close(rsp_mqd);
+    munmap(shm_addr, BUFSIZE);
+    unlink("./client-shm");
 }
 
 // Read in the filenames to transfer
