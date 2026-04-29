@@ -1,3 +1,20 @@
+// For sources, I used:
+// - manpages
+// - textbook (i finally got it)
+// - https://cplusplus.com/reference/cstdio/snprintf/
+//
+// typically i implement my own message queues from scratch using circular buffer so this was
+// pretty interesting since the mqueue lib handles a lot of it
+// also sorry i submitted this late it slipped my mind.
+// had it written down as due last saturday and forgot to reschedule
+//
+// oh might as well write down how this works
+// 1. server recieves request from client via cmd-queue
+// 2. server gets the first file in the queue and sends it back. chunks if needed
+// 3. client recieves file, and writes (it also sends next to request next file/ack file recieved)
+// 4. once all files are recieved, it sends a close message and closes down client
+// 5. if server finds a close message, it shuts down too
+//
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <errno.h>
@@ -8,6 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mqueue.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #define BUFSIZE 512
 
@@ -42,5 +63,80 @@ int main(int argc, char** argv) {
     }
 
     /* Server Code Here */
-    printf("You need to write the code to make this do something!\n");
+    // printf("You need to write the code to make this do something!\n");
+    const char* cmd_queue = "/cmd-queue";// incoming
+    const char* rsp_queue = "/rsp-queue"; // outgoing
+    struct mq_attr attr;
+    char requested_file[BUFSIZE];
+    // i could length-prefix filepath i suppose.
+    // i think 128 is just fine esp for utf-8
+    // not sure if you're going to test larger files so i left as is
+    char filepath[128];
+    char response[BUFSIZE + 1];
+    char msgbuf[BUFSIZE + 1];
+
+    memset(&attr, 0, sizeof(attr));
+    attr.mq_maxmsg = 10;
+    attr.mq_msgsize = BUFSIZE;
+
+    mqd_t mqd = mq_open(cmd_queue, O_CREAT | O_RDONLY, S_IRUSR | S_IWUSR, &attr);
+    mqd_t rsp_mqd = mq_open(rsp_queue, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR, &attr);
+    if (mqd == (mqd_t) -1) {
+        perror("failed to open message queue");
+        exit(1);
+    }
+    if (rsp_mqd == (mqd_t) -1) {
+        perror("failed to open response queue");
+        exit(1);
+    }
+
+    ssize_t num_read;
+    size_t shm_size;
+    for (;;) {
+        num_read = mq_receive(mqd, msgbuf, BUFSIZE, NULL);
+        if (num_read == -1) {
+            mq_close(mqd);
+            mq_close(rsp_mqd);
+            mq_unlink(cmd_queue);
+            mq_unlink(rsp_queue);
+            exit(1);
+        }
+
+        msgbuf[num_read] = '\0';
+        printf("received: %s\n", msgbuf);
+
+        if (strcmp(msgbuf, "close") == 0) break;
+
+        sscanf(msgbuf, "%zu:%s", &shm_size, requested_file);
+        int shm_fd = open("./client-shm", O_RDWR);
+        if (shm_fd == -1) {
+            perror("failed to initialize shared memory");
+            exit(1);
+        }
+        ftruncate(shm_fd, BUFSIZE);
+        char* shm_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+
+        requested_file[strcspn(requested_file, "\r\n")] = '\0';
+        snprintf(filepath, sizeof(filepath), "./server_files/%s", requested_file);
+        FILE* fp = fopen(filepath, "rwb");
+
+        for (;;) {
+            size_t bytes_read = fread(shm_addr, 1, shm_size, fp);
+            snprintf(response, sizeof(response), "%zu", bytes_read);
+            mq_send(rsp_mqd, response, strlen(response), 0);
+
+            if (bytes_read != shm_size) break;
+
+            num_read = mq_receive(mqd, msgbuf, BUFSIZE, NULL);
+            msgbuf[num_read] = '\0';
+        }
+
+        fclose(fp);
+        munmap(shm_addr, shm_size);
+    }
+
+    mq_close(mqd);
+    mq_close(rsp_mqd);
+    mq_unlink(cmd_queue);
+    mq_unlink(rsp_queue);
 }
