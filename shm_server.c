@@ -2,6 +2,9 @@
 // - manpages
 // - textbook (i finally got it)
 // - https://cplusplus.com/reference/cstdio/snprintf/
+// - https://en.wikipedia.org/wiki/Semaphore_(programming)
+// - https://medium.com/@akshatarhabib/understanding-semaphores-in-c-04835e97024f
+// - https://man7.org/linux/man-pages/man7/sem_overview.7.html
 //
 // typically i implement my own message queues from scratch using circular buffer so this was
 // pretty interesting since the mqueue lib handles a lot of it
@@ -10,10 +13,15 @@
 //
 // oh might as well write down how this works
 // 1. server recieves request from client via cmd-queue
-// 2. server gets the first file in the queue and sends it back. chunks if needed
-// 3. client recieves file, and writes (it also sends next to request next file/ack file recieved)
+// 2. server gets the first file in the queue and sends it back. chunks if needed.
+// it waits on write-sem before writing each chunk into shared memory, then posts to read-sem
+// 3. client recieves file, and writes (it also sends next to request next file/ack file recieved).
+// it waits on read-sem before reading each chunk, then posts to write-sem when done
 // 4. once all files are recieved, it sends a close message and closes down client
 // 5. if server finds a close message, it shuts down too
+//
+// i cannot for the life of me figure out how to get the client to retry. i initially got a segfault, fixed that, but now it hangs.
+// I KNOW my logic is perfect and it should work. anyways, i'm not sure why it won't work. would appreciiate it if you could take a look
 //
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -29,6 +37,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <semaphore.h>
 
 #define BUFSIZE 512
 
@@ -79,6 +88,10 @@ int main(int argc, char** argv) {
     attr.mq_maxmsg = 10;
     attr.mq_msgsize = BUFSIZE;
 
+    sem_unlink("/write-sem");
+    sem_unlink("/read-sem");
+    sem_t* write_sem = sem_open("/write-sem", O_CREAT, S_IRUSR | S_IWUSR, 1);
+    sem_t* read_sem = sem_open("/read-sem", O_CREAT, S_IRUSR | S_IWUSR, 0);
     mqd_t mqd = mq_open(cmd_queue, O_CREAT | O_RDONLY, S_IRUSR | S_IWUSR, &attr);
     mqd_t rsp_mqd = mq_open(rsp_queue, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR, &attr);
     if (mqd == (mqd_t) -1) {
@@ -119,11 +132,21 @@ int main(int argc, char** argv) {
         requested_file[strcspn(requested_file, "\r\n")] = '\0';
         snprintf(filepath, sizeof(filepath), "./server_files/%s", requested_file);
         FILE* fp = fopen(filepath, "rwb");
+        if (fp == NULL) {
+            sem_wait(write_sem); // wait for client to finish reading/writing
+            memcpy(shm_addr, "FNF", 3);
+            mq_send(rsp_mqd, "3", 1, 0);
+            munmap(shm_addr, shm_size);
+            sem_post(read_sem); // let client read err message
+            continue;
+        }
 
         for (;;) {
+            sem_wait(write_sem);
             size_t bytes_read = fread(shm_addr, 1, shm_size, fp);
             snprintf(response, sizeof(response), "%zu", bytes_read);
             mq_send(rsp_mqd, response, strlen(response), 0);
+            sem_post(read_sem);
 
             if (bytes_read != shm_size) break;
 
@@ -139,4 +162,8 @@ int main(int argc, char** argv) {
     mq_close(rsp_mqd);
     mq_unlink(cmd_queue);
     mq_unlink(rsp_queue);
+    sem_close(write_sem);
+    sem_close(read_sem);
+    sem_unlink("/write-sem");
+    sem_unlink("/read-sem");
 }

@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <semaphore.h>
 
 int readFilenames();
 
@@ -67,12 +68,12 @@ int main(int argc, char** argv) {
      *  You can modify this to call your code to request a file "num_files" times
      */
     fprintf(stdout, "Num files: %d\n", num_files);
-    
+
     for (int i = 0; i < num_files; i++) {
         printf("%d - ", i);
         printf("%s", files[i % 5]);
     }
-    
+
     const char* cmd_queue = "/cmd-queue";
     const char* rsp_queue = "/rsp-queue";
 
@@ -89,8 +90,18 @@ int main(int argc, char** argv) {
     ftruncate(shm_fd, BUFSIZE);
     char* shm_addr = mmap(NULL, BUFSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 
-    mqd_t mqd = mq_open(cmd_queue, O_WRONLY);
-    mqd_t rsp_mqd = mq_open(rsp_queue, O_RDONLY);
+    mqd_t mqd;
+    mqd_t rsp_mqd;
+    while ((mqd = mq_open(cmd_queue, O_WRONLY)) == (mqd_t) -1) {
+        printf("connecting...\n");
+        sleep(1);
+    }
+    while ((rsp_mqd = mq_open(rsp_queue, O_RDONLY)) == (mqd_t) -1) sleep(1);
+    sem_t* write_sem;
+    sem_t* read_sem;
+    while ((write_sem = sem_open("/write-sem", 0)) == SEM_FAILED && errno == ENOENT) sleep(1);
+    while ((read_sem = sem_open("/read-sem", 0)) == SEM_FAILED && errno == ENOENT) sleep(1);
+
     if (mqd == (mqd_t) -1) {
         perror("failed to open message queue");
         exit(1);
@@ -112,7 +123,13 @@ int main(int argc, char** argv) {
             size_t rsp_len = mq_receive(rsp_mqd, response, BUFSIZE, NULL);
             response[rsp_len] = '\0';
             size_t bytes = strtoull(response, NULL, 10);
+            sem_wait(read_sem); // wait until the server finishes writing next chunk
+            if (bytes == 3 && memcmp(shm_addr, "FNF", 3) == 0) {
+                sem_post(write_sem);
+                break;
+            }
             fwrite(shm_addr, 1, bytes, fp);
+            sem_post(write_sem); // let server write another chunk
             if (bytes != BUFSIZE) break;
 
             mq_send(mqd, "next", 4, 0);
@@ -127,6 +144,8 @@ int main(int argc, char** argv) {
     mq_close(rsp_mqd);
     munmap(shm_addr, BUFSIZE);
     unlink("./client-shm");
+    sem_close(write_sem);
+    sem_close(read_sem);
 }
 
 // Read in the filenames to transfer
