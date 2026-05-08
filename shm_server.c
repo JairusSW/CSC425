@@ -130,8 +130,19 @@ int main(int argc, char** argv) {
         char* shm_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 
         requested_file[strcspn(requested_file, "\r\n")] = '\0';
-        snprintf(filepath, sizeof(filepath), "./server_files/%s", requested_file);
-        FILE* fp = fopen(filepath, "rwb");
+        // snprintf(filepath, sizeof(filepath), "./server_files/%s", requested_file);
+        // in all honesty, i'm confused by what compiler error you're getting. all i can think of is that you're on a different version of gcc or perhaps libc?
+        // anyways, i swapped out snprintf with a manual copy. i'm not sure where you got that compiler error, but hopefully you don't anymore
+        strcpy(filepath, "./server_files/");
+        strcat(filepath, requested_file);
+
+        // i think it was also failing here becuse I put rwb in. i assumed rw was valid since it's read-write-binary but i looked it up and it should be rb
+        // https://man7.org/linux/man-pages/man3/fopen.3.html
+        // https://www.geeksforgeeks.org/c/c-fopen-function-with-examples/
+        //
+        // it probably silently rejected it? anyways, it sometimes corrupted all the files for me. might have converted to utf-8 instead of binary?
+        // 
+        FILE* fp = fopen(filepath, "rb");
         if (fp == NULL) {
             sem_wait(write_sem); // wait for client to finish reading/writing
             memcpy(shm_addr, "FNF", 3);
